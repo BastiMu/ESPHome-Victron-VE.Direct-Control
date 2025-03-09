@@ -1,0 +1,215 @@
+esphome:
+  name: esp32c3_uart
+  friendly_name: ESP32C3_UART
+  includes:
+    - "uart_read_sensor.h"
+
+esp32:
+  board: esp32-c3-devkitm-1
+  framework:
+    type: esp-idf
+
+wifi:
+  ssid: "YourWifiSSID"
+  password: "YourWifiPassword"
+
+  # Enable fallback hotspot (captive portal) in case wifi connection fails
+  ap:
+    ssid: "ESP32C3_UART Fallback Hotspot"
+    password: "ESP32C3_UART"
+
+# Enable Home Assistant API
+api:
+  password: ""
+
+time:
+  - platform: homeassistant
+    id: my_time
+
+ota:
+  - platform: esphome
+    password: ""
+
+# Enable logging
+logger:
+
+web_server:
+  port: 80
+
+# Example configuration entry
+uart:
+  tx_pin: GPIO21
+  rx_pin: GPIO20
+  baud_rate: 19200
+  debug:
+    direction: BOTH
+    dummy_receiver: true
+    after:
+      delimiter: "\r\n"
+    sequence:
+      - lambda: |
+          if (direction == UART_DIRECTION_TX) {
+            UARTDebug::log_hex(direction, bytes, ' ');
+            UARTDebug::log_string(direction, bytes);
+            return;
+          }
+          std::string field = getFieldFromBytes(bytes);
+          if (field.compare("PID") == 0) { // PID
+            id(pid).publish_state(getValueFromBytes(bytes));
+          } else if (field.compare("FWE") == 0) { // FWE
+            id(fwe).publish_state(getValueFromBytes(bytes));
+          } else if (field.compare("SER#") == 0) { // SER#
+            id(ser).publish_state(getValueFromBytes(bytes));
+          } else if (field.compare("V") == 0) { // V
+            float voltage = std::stof(getValueFromBytes(bytes));
+            id(v).publish_state(voltage/1000); // mV -> V
+          } else if (field.compare("I") == 0) { // I
+            float ampere = std::stof(getValueFromBytes(bytes));
+            id(i).publish_state(ampere/1000); // mA -> A
+          } else if (field.compare("T") == 0) { // T
+            id(t).publish_state(getValueFromBytes(bytes));
+          } else if (field.compare("ERR") == 0) { // ERR
+            id(err).publish_state(std::stoi(getValueFromBytes(bytes)));
+          } else if (field.compare("CS") == 0) { // CS
+            id(cs).publish_state(std::stoi(getValueFromBytes(bytes)));
+          } else if (field.compare("HC#") == 0) { // HC#
+            id(hc).publish_state(std::stoi(getValueFromBytes(bytes)));
+          } else if (field.compare("Checksum") == 0) { // Checksum
+            id(checksum).publish_state(bytes[9]);
+          } else if (field.compare("") == 0) { // new cycle
+            // do nothing
+          } else {
+            UARTDebug::log_hex(direction, bytes, ' ');
+            UARTDebug::log_string(direction, bytes);
+          }
+
+globals:
+   - id: a_global_value
+     type: int
+     restore_value: yes
+     initial_value: '1'
+
+button:
+  - platform: template
+    name: "Send Hello"
+    id: send_hello
+    on_press:
+      - uart.write: [0x0D, 0x0A, 0x3A, 0x31, 0x35, 0x34, 0x0A]
+
+text_sensor:
+  - platform: template
+    name: PID
+    id: pid
+  - platform: template
+    name: FWE
+    id: fwe
+  - platform: template
+    name: SER#
+    id: ser
+  - platform: template
+    name: T
+    id: t
+
+sensor:
+  - platform: template
+    name: V
+    id: v
+    unit_of_measurement: "V"
+    accuracy_decimals: 2
+  - platform: template
+    name: I
+    id: i
+    unit_of_measurement: "A"
+    accuracy_decimals: 1
+  - platform: template
+    name: ERR
+    id: err
+    accuracy_decimals: 0
+  - platform: template
+    name: CS
+    id: cs
+    accuracy_decimals: 0
+  - platform: template
+    name: HC#
+    id: hc
+    accuracy_decimals: 0
+  - platform: template
+    name: Checksum
+    id: checksum
+    accuracy_decimals: 0
+
+number:
+  - platform: template
+    name: Current Set
+    id: i_set
+    min_value: 2
+    max_value: 8
+    step: 0.1
+    optimistic: true
+    set_action:
+      then:
+        - uart.write: !lambda |-
+            // declare message
+            std::vector<unsigned char> message = {0x0D, 0x0A, 0x3A, 0x38, 0x46, 0x30, 0x45, 0x44, 0x30, 0x30};
+            // payload
+            int val = static_cast<int>(x * 10);
+            std::vector<unsigned char> payload = getPayload(val);
+            message.push_back(payload[0]);
+            message.push_back(payload[1]);
+            // seperator
+            message.push_back(0x30);
+            message.push_back(0x30);
+            // CRC
+            std::vector<unsigned char> crc = getPayload(0x70 - val);
+            message.push_back(crc[0]);
+            message.push_back(crc[1]);
+            // end
+            message.push_back(0x0A);
+            return message;
+  - platform: template
+    name: Voltage Set
+    id: v_set
+    min_value: 25.6
+    max_value: 29.4
+    step: 0.01
+    optimistic: true
+    set_action:
+      then:
+        - uart.write: !lambda |-
+            // declare message
+            std::vector<unsigned char> message = {0x0D, 0x0A, 0x3A, 0x38, 0x45, 0x39, 0x45, 0x44, 0x30, 0x30};
+            // payload
+            uint8_t val;
+            bool overflow;
+            if (x < 28.15) { // normal voltage
+              val = static_cast<uint8_t>(round((x - 25.6) * 100));
+              overflow = false;
+            } else if (x == 28.15) { // 28.15 not exists, set to 28.14
+              val = static_cast<uint8_t>(round((28.14 - 25.6) * 100));
+              overflow = false;
+            } else { // high voltage
+              val = static_cast<uint8_t>(round((x - 28.16) * 100));
+              overflow = true;
+            }
+            std::vector<unsigned char> payload = getPayload(val);
+            message.push_back(payload[0]);
+            message.push_back(payload[1]);
+            // seperator
+            message.push_back(0x30);
+            if (!overflow) {
+              message.push_back(0x41);
+            } else {
+              message.push_back(0x42);
+            }
+            // CRC
+            std::vector<unsigned char> crc;
+            if (!overflow) {
+              crc = getPayload(0x6D - val);
+            } else {
+              crc = getPayload(0x6C - val);
+            }
+            message.push_back(crc[0]);
+            message.push_back(crc[1]);
+            // end
+            message.push_back(0x0A);
+            return message;
